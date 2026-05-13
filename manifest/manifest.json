@@ -1,0 +1,41 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.17/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.17",
+  "version": "0.2.0",
+  "id": "26aed556-ad98-46b0-8454-31638b7b3496",
+  "developer": {
+    "name": "Okta Demo",
+    "websiteUrl": "https://www.okta.com",
+    "privacyUrl": "https://www.okta.com/privacy-policy/",
+    "termsOfUseUrl": "https://www.okta.com/terms/"
+  },
+  "name": {
+    "short": "Foundry Okta Bot",
+    "full": "Foundry + Teams + Okta reference bot"
+  },
+  "description": {
+    "short": "Reference architecture bot (Phase 1: echo).",
+    "full": "Demo bot for the Azure AI Foundry + MS Teams + Okta reference architecture. Phase 1 is an echo bot; later phases wire in the Foundry agent and Okta-authorized tool calls."
+  },
+  "icons": {
+    "color": "color.png",
+    "outline": "outline.png"
+  },
+  "accentColor": "#007DC1",
+  "bots": [
+    {
+      "botId": "17c77713-240c-403a-8013-acda953d2677",
+      "scopes": ["personal"],
+      "isNotificationOnly": false,
+      "supportsFiles": false,
+      "supportsCalling": false,
+      "supportsVideo": false
+    }
+  ],
+  "permissions": ["identity", "messageTeamMembers"],
+  "validDomains": [
+    "foundry-teams-bot-for-okta-app.azurewebsites.net",
+    "token.botframework.com",
+    "oktaforai.oktapreview.com"
+  ]
+}
