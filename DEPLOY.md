@@ -1,28 +1,30 @@
 # Deployment walkthrough
 
-This is the step-by-step build that was used to stand the demo up end-to-end. Run in order; each phase verifies before moving to the next.
+End-to-end build of the demo. Follow in order; each phase verifies before moving to the next.
 
-## 1. Create the Azure Bot resource
+## 0. Prereqs check
 
-1. [portal.azure.com](https://portal.azure.com) → search "Azure Bot" → Create.
-2. Fill in:
-   - **Bot handle**: unique name (e.g. `foundry-teams-bot`).
-   - **Subscription / Resource group**: pick/create.
-   - **Pricing tier**: Free (F0).
-   - **Microsoft App ID → Type of App**: Single Tenant.
-   - **Creation type**: Create new Microsoft App ID.
-3. Review + Create → Create.
-4. Once deployed, grab:
-   - Microsoft App ID (Configuration blade).
-   - Tenant ID (Configuration blade).
-   - Client secret (Manage Password → opens Entra app → Certificates & secrets → New client secret → copy the Value immediately).
+- [ ] Azure subscription with permission to create resources.
+- [ ] Entra tenant with **Teams licensing** (M365 Business Basic / E-series). MSA-owned default directories don't qualify; create a native Entra user + grab a Business Basic trial if you have only an MSA.
+- [ ] Okta org (Okta Preview works). Admin access.
+- [ ] Node.js 20+ locally.
 
-## 2. Create the App Service and deploy
+## 1. Azure Bot resource
 
-Easiest path is Azure Cloud Shell (avoids local TLS / proxy issues on some corporate networks):
+1. portal.azure.com → search "Azure Bot" → Create.
+2. Bot handle: globally unique (e.g., `foundry-teams-bot-<suffix>`); pricing tier `Free (F0)`; **Single Tenant**; **Create new Microsoft App ID**.
+3. After deploy, capture from the resource:
+   - **Microsoft App ID** (Configuration blade)
+   - **Tenant ID** (Configuration blade)
+   - **Client secret** (Manage Password → Entra app → Certificates & secrets → New client secret → copy the value once).
+4. **Settings → Channels → + Microsoft Teams** → accept terms (this is what allows the Teams app to install — easy to miss; without it sideload fails with `AddAppBotToChatRosterFailed`).
+
+## 2. App Service + initial deploy
+
+Easiest from Azure Cloud Shell (avoids local TLS / corp-DNS issues):
 
 ```bash
-# From an unzipped checkout at ~/foundry-teams-bot
+# From an unzipped checkout in the home directory
 cd ~/foundry-teams-bot
 az webapp up \
   --name <globally-unique-app-name> \
@@ -31,9 +33,7 @@ az webapp up \
   --location westus3
 ```
 
-Note the generated resource group name from the command's JSON output.
-
-Then set the four Bot Framework settings:
+Note the resource group name from the JSON output. Then bot Framework settings:
 
 ```bash
 az webapp config appsettings set \
@@ -46,18 +46,13 @@ az webapp config appsettings set \
     MicrosoftAppTenantId=<tenant-id>
 ```
 
-Point the Azure Bot at the App Service:
+Point the Azure Bot's **Messaging endpoint** to `https://<app-name>.azurewebsites.net/api/messages`. Test in the bot's **Test in Web Chat** — should echo or, after the next phase, hit gpt-4o.
 
-- Azure Bot → **Settings → Configuration → Messaging endpoint**: `https://<app-name>.azurewebsites.net/api/messages`.
-- Save.
-- Test via **Test in Web Chat** → send "hi" → expect an echo (if still on the echo version of `bot.js`) or a gpt-4o reply (if Azure OpenAI is configured, see §3).
+## 3. Azure OpenAI / gpt-4o
 
-## 3. Wire Azure OpenAI
-
-1. Create an Azure OpenAI resource in the portal (any region where gpt-4o is available).
-2. Deploy a `gpt-4o` model in Azure AI Foundry / the OpenAI resource.
-3. Grab the endpoint and Key 1 from the resource's **Keys and Endpoint** blade.
-4. Add App Service settings:
+1. Create an Azure OpenAI resource; deploy a `gpt-4o` model in Azure AI Foundry.
+2. Grab Endpoint + Key 1 from "Keys and Endpoint".
+3. Add settings:
 
 ```bash
 az webapp config appsettings set \
@@ -70,58 +65,109 @@ az webapp config appsettings set \
     AZURE_OPENAI_API_VERSION=2024-10-21
 ```
 
-Verify in Web Chat by asking a real question; gpt-4o should respond.
+Web Chat now responds with real model output.
 
-## 4. Teams installation
+## 4. Teams app installation
 
-This requires a real work/school tenant with Teams licensing. A personal-MSA-owned "Default Directory" tenant **cannot** host work Teams. If you only have an MSA tenant, create an Entra-native user there and sign that user up for a Microsoft 365 Business Basic trial to get Teams licensing.
+1. **Teams admin center → Teams apps → Setup policies → Global → Upload custom apps: On** (admin permission required).
+2. In Teams (Chrome/Edge — Safari has known issues with Teams web): **Apps → Manage your apps → Upload an app → Upload a custom app** → pick `teams-app-package.zip` → Add.
+3. Send "hi" → bot should reply via gpt-4o.
 
-1. Enable the Microsoft Teams channel on the Azure Bot:
-   - Bot resource → **Settings → Channels** → add **Microsoft Teams** → accept terms.
-2. Enable custom app upload:
-   - [admin.teams.microsoft.com](https://admin.teams.microsoft.com) → Teams apps → Setup policies → Global → turn on **Upload custom apps**.
-3. In Teams (Chrome/Edge work; Safari does not) → Apps → Manage your apps → Upload an app → Upload a custom app → pick `teams-app-package.zip`.
-4. "Add" → the bot appears as a personal chat. Verify gpt-4o responses.
+## 5. Okta OIDC application (user sign-in)
 
-## 5. Okta OAuth sign-in
+1. Okta admin (`https://<org>.okta.com/admin`) → Applications → Create App Integration → **OIDC Web Application**.
+   - Grant types: **Authorization Code** + **Refresh Token**.
+   - Sign-in redirect URI: `https://<app-name>.azurewebsites.net/api/okta-callback` (this is the bot's own callback endpoint; it must be hosted before sign-in works).
+   - Sign-out redirect URIs: optional; if you set one, it lets `/logout-okta` post-redirect somewhere clean.
+   - Assignments: pick a group or "Everyone in the organization" for testing.
+2. Capture **Client ID** and **Client Secret** from the new app's General tab.
 
-1. In Okta admin (`https://<org>.okta.com/admin`) → Applications → Create App Integration → OIDC Web Application.
-   - Grant types: Authorization Code + Refresh Token.
-   - Sign-in redirect URI: `https://token.botframework.com/.auth/web/redirect`.
-   - Assign the app to your test users (or "Allow everyone in your organization").
-2. Note the Client ID, Client Secret, and (if using a custom authorization server) the auth-server ID.
-3. Azure Bot → Settings → Configuration → OAuth Connection Settings → **+ Add**.
-   - Name: `Okta Oauth` (referenced by the bot's `OAUTH_CONNECTION_NAME` setting).
-   - Service Provider: **Oauth 2 Generic Provider**.
-   - Client ID, Client Secret: from Okta.
-   - Scopes: `openid profile email offline_access`.
-   - **Authorization URL template**: `https://<org>.okta.com/oauth2/<auth-server-id>/v1/authorize`
-   - **Authorization URL query string template**: `?client_id={ClientId}&response_type=code&redirect_uri={RedirectUrl}&scope={Scopes}&state={State}`
-   - **Token URL template**: `https://<org>.okta.com/oauth2/<auth-server-id>/v1/token`
-   - **Token URL query string template**: `?` *(single question mark — the field is marked required but we need an empty query string so Bot Service POSTs the body)*
-   - **Token Body Template**: `code={Code}&grant_type=authorization_code&redirect_uri={RedirectUrl}&client_id={ClientId}&client_secret={ClientSecret}`
-   - **Refresh URL template**: `https://<org>.okta.com/oauth2/<auth-server-id>/v1/token`
-   - **Refresh URL query string template**: `?`
-   - **Refresh Body Template**: `refresh_token={RefreshToken}&grant_type=refresh_token&client_id={ClientId}&client_secret={ClientSecret}`
-4. Save → click the connection → **Test Connection**. An Okta login should pop; signing in should show a success page.
-5. Add the connection name to App Service settings:
+## 6. Custom Authorization Server (XAA target)
+
+This is where Cross-App Access policy lives. **Don't reuse the org default auth server**; spin up a clean one for the demo.
+
+1. Okta admin → **Security → API → Authorization Servers → + Add Authorization Server**.
+   - Name: e.g. `Foundry Demo Auth Server`.
+   - Audience: a placeholder URI you'll register resources under (e.g. `api://foundry-demo`); doesn't have to match anything yet.
+   - Note the resulting **Authorization Server ID** (e.g. `ausyrbiuzeYR2sAeu1d7`).
+2. **Scopes tab** → add `mcp:read` (or whatever scopes you'll grant the agent).
+3. **Audiences tab / Settings** → register the resource URI you intend to address tokens to (e.g. `https://oktademo.mcp.servicenow.com`).
+4. **Access Policies tab** → add a policy allowing the OIDC app from step 5 to use this auth server (with grant types including Token Exchange).
+
+## 7. Okta AI Agent (agent machine identity)
+
+1. Okta admin → **Directory → AI Agents → Register AI agent → Register manually**.
+   - Name: e.g. `Foundry Agent`.
+   - Description: short.
+   - Application: **link** the OIDC app from step 5.
+   - **Save** → on the agent's detail:
+     - **Owners** tab: assign yourself or a group with ≥2 members.
+     - **Credentials** tab: **Add public key → Generate new key**. **Copy the JSON immediately and store it in a vault** — Okta only shows the private half once.
+     - **... → Activate**.
+2. **Resource Connections** tab → **+ Add connection** → **Authorization Server** → pick the one from step 6 → allow scope `mcp:read` (or "Allow all" for a demo).
+
+## 8. Bot — Path B (own OAuth flow) settings
+
+The bot doesn't use Bot Service's Generic OAuth Connection; instead it runs its own OAuth code flow and its own callback endpoint, so it can capture the **ID token** Bot Service hides from generic-OAuth callers.
 
 ```bash
 az webapp config appsettings set \
   --name <app-name> \
   --resource-group <rg-name> \
-  --settings "OAUTH_CONNECTION_NAME=Okta Oauth"
+  --settings \
+    OKTA_DOMAIN=https://<your-org>.okta.com \
+    OKTA_OIDC_CLIENT_ID=<client-id-from-step-5> \
+    OKTA_REDIRECT_URI=https://<app-name>.azurewebsites.net/api/okta-callback \
+    OKTA_AUTHORIZATION_SERVER_ID=<authServerId-from-step-6> \
+    OKTA_AGENT_PRINCIPAL_ID=<agentId-from-step-7> \
+    OKTA_REQUESTED_SCOPE=mcp:read \
+    OKTA_RESOURCE_AUDIENCE=https://oktademo.mcp.servicenow.com \
+    'OKTA_OIDC_CLIENT_SECRET=<secret-from-step-5>' \
+    'OKTA_AGENT_PRIVATE_JWK=<full JWK JSON from step 7>'
 ```
 
-6. Update the Teams manifest's `validDomains` to include `oktaforai.oktapreview.com` (or your Okta domain) and `token.botframework.com`, rebuild `teams-app-package.zip`, and re-upload in Teams (Update or Remove-and-reinstall).
+Both `OKTA_OIDC_CLIENT_SECRET` and `OKTA_AGENT_PRIVATE_JWK` are sensitive. Type the command in Cloud Shell with the values pasted directly from your vault — don't share them anywhere else. Single quotes preserve special chars / JSON braces.
 
-7. Chat the bot → expect a sign-in card → Okta login → "You're signed in with Okta" → subsequent messages hit gpt-4o.
+Deploy the bot zip:
 
-## Gotchas we hit
+```bash
+az webapp deploy \
+  --resource-group <rg-name> \
+  --name <app-name> \
+  --src-path ~/foundry-teams-bot.zip \
+  --type zip
+```
 
-- **Corporate DNS filters / TLS interception** break `az cli` and `devtunnel` locally. Work in Azure Cloud Shell to avoid these.
-- **Personal MSA tenants ("Default Directory")** can't host Teams for Work. You need a native Entra user and a Teams-licensed SKU.
-- **M365 Developer Program** now requires Visual Studio subscription / MPN partner status. Business Basic trial ($0 for 30 days, credit card required, auto-renews) is the realistic free path.
-- **Teams channel is off by default** on new Azure Bots. Enable it under Settings → Channels or you'll get `AddAppBotToChatRosterFailed` on sideload.
-- **Bot Service's "Oauth 2 Generic Provider"** marks the Token URL query string template as required even though we want it empty. Use `?` to satisfy the validator without breaking the POST flow.
-- **`handleTeamsSigninVerifyState`** must pass `query.state` as the `magicCode` argument to `userTokenClient.getUserToken()`. Without it, the token lookup returns null after a successful sign-in and the bot shows "Sign-in didn't complete."
+## 9. Verify the chain
+
+In Teams:
+
+1. Send "hi" → bot replies with HeroCard "Sign in with Okta".
+2. Click → browser → Okta login → "You're signed in" page.
+3. Return to Teams.
+4. `/whoami` → bot prints your Okta email.
+5. `/testjag` → status 200 with `issued_token_type: ...id-jag` and an ID-JAG JWT.
+6. `/testresource` → both legs return 200; final token decoded shows `aud=<resource>`, `sub=<your-email>`, `cid=<agent-principal-id>`, `scp=["mcp:read"]`.
+7. Normal chat (anything that's not a command) → gpt-4o reply.
+
+## Common errors + fixes (XAA chain)
+
+| Error | Cause | Fix |
+|---|---|---|
+| `invalid_client: kid is invalid` | JWK in App Settings doesn't match agent's currently-active public key. | Regenerate key in Okta, paste new JWK into `OKTA_AGENT_PRIVATE_JWK`. |
+| `actor_token is missing` | Subject is access_token; Okta requires actor_token on access-token-as-subject paths. | The bot already sends actor_token; this should not appear in the current code. |
+| `actor_token_type is invalid or not supported` | Wrong literal. | Must be exactly `urn:ietf:params:oauth:token-type:access_token`. |
+| `subject_token is invalid` | Access token (not id_token) sent as subject when policy requires id_token. | Use Path B (real ID token), not the access token from Bot Framework. |
+| `subject_token_type is invalid or not supported` | Asking for `id-jag` while subject is `access_token`. | Use ID token as subject when `requested_token_type=id-jag`. |
+| `invalid_target` | No Resource Connection on the AI Agent permitting this audience. | Configure step 7's Resource Connection. |
+| `requested_token_type is invalid or not supported` (custom server endpoint) | Custom auth servers don't issue ID-JAGs directly. | Hit ORG token endpoint for leg 1; only hit custom server for leg 2 (jwt-bearer). |
+| `id-jag request must not include a 'scope' parameter` | Leg 2 with redundant `scope`. | Drop `scope` from the jwt-bearer request; it's already in the ID-JAG. |
+| `grant was issued for another authorization server` | Leg 2 sent to org token endpoint instead of custom auth server endpoint. | Use `${OKTA_DOMAIN}/oauth2/${authServerId}/v1/token` for leg 2. |
+
+## Other gotchas
+
+- **Corp networks** with TLS interception or strict DNS filtering may block `az` CLI and `devtunnel` locally. Use Azure Cloud Shell.
+- **MSA-owned tenants** can't host Teams for Work. Create a native Entra user + Business Basic trial.
+- **M365 Developer Program** now requires Visual Studio subscription / MPN. Use Business Basic trial instead.
+- **In-memory token store**: every App Service restart forces re-auth. Acceptable for demos, not for prod.
+- **Safari + Teams**: Teams web doesn't always work in Safari (especially private mode). Chrome/Edge are reliable.
