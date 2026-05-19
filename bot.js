@@ -3,20 +3,17 @@ const {
   MessageFactory,
   CardFactory,
 } = require('botbuilder');
-const { AzureOpenAI } = require('openai');
+const { AIProjectClient } = require('@azure/ai-projects');
+const { DefaultAzureCredential } = require('@azure/identity');
 const { SignJWT, importJWK } = require('jose');
 const tokenStore = require('./oktaTokenStore');
-
-const SYSTEM_PROMPT =
-  'You are a helpful assistant in a Microsoft Teams chat. Keep replies concise and conversational.';
-const MAX_HISTORY_MESSAGES = 20;
 
 class EchoBot extends TeamsActivityHandler {
   constructor() {
     super();
 
-    this.deployment = process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4o';
-    this.histories = new Map();
+    this.agentName = process.env.FOUNDRY_AGENT_NAME || 'Foundry-Okta-Agent';
+    this.foundryConversations = new Map();
 
     this.onMessage(async (context, next) => {
       const userId = context.activity.from.id;
@@ -83,7 +80,7 @@ class EchoBot extends TeamsActivityHandler {
         return next();
       }
 
-      await this._respondWithGpt(context);
+      await this._respondWithFoundryAgent(context);
       await next();
     });
 
@@ -345,49 +342,55 @@ class EchoBot extends TeamsActivityHandler {
     return lines.join('\n');
   }
 
-  async _respondWithGpt(context) {
-    const convId = context.activity.conversation.id;
-    const history = this.histories.get(convId) || [];
-    history.push({ role: 'user', content: context.activity.text });
+  async _respondWithFoundryAgent(context) {
+    const teamsConvId = context.activity.conversation.id;
+    const userText = context.activity.text;
 
     try {
-      const client = this._getClient();
-      const response = await client.chat.completions.create({
-        model: this.deployment,
-        messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...history],
-        temperature: 0.3,
-      });
+      const openai = this._getOpenAIFromProject();
+      let foundryConvId = this.foundryConversations.get(teamsConvId);
 
-      const reply = response.choices?.[0]?.message?.content || '(no reply)';
-      history.push({ role: 'assistant', content: reply });
+      if (!foundryConvId) {
+        const conv = await openai.conversations.create({
+          items: [{ type: 'message', role: 'user', content: userText }],
+        });
+        foundryConvId = conv.id;
+        this.foundryConversations.set(teamsConvId, foundryConvId);
+      } else {
+        await openai.conversations.items.create(foundryConvId, {
+          items: [{ type: 'message', role: 'user', content: userText }],
+        });
+      }
 
-      while (history.length > MAX_HISTORY_MESSAGES) history.shift();
-      this.histories.set(convId, history);
+      const response = await openai.responses.create(
+        { conversation: foundryConvId },
+        { body: { agent_reference: { type: 'agent_reference', name: this.agentName } } },
+      );
+      const reply = response.output_text || '(no reply)';
 
       await context.sendActivity(MessageFactory.text(reply));
     } catch (err) {
-      console.error('[FoundryBot] error calling Azure OpenAI:', err);
+      console.error('[FoundryBot] error calling Foundry agent:', err);
+      this.foundryConversations.delete(teamsConvId);
       await context.sendActivity(
-        MessageFactory.text(`Error talking to the model: ${err.message}`),
+        MessageFactory.text(`Error talking to the agent: ${err.message}`),
       );
     }
   }
 
-  _getClient() {
-    if (this._client) return this._client;
-    const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
-    const apiKey = process.env.AZURE_OPENAI_API_KEY;
-    if (!endpoint || !apiKey) {
+  _getOpenAIFromProject() {
+    if (this._openai) return this._openai;
+    const endpoint = process.env.FOUNDRY_PROJECT_ENDPOINT;
+    if (!endpoint) {
       throw new Error(
-        'AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY must be set as app settings.',
+        'FOUNDRY_PROJECT_ENDPOINT must be set as an app setting.',
       );
     }
-    this._client = new AzureOpenAI({
-      endpoint,
-      apiKey,
-      apiVersion: process.env.AZURE_OPENAI_API_VERSION || '2024-10-21',
-    });
-    return this._client;
+    if (!this._project) {
+      this._project = new AIProjectClient(endpoint, new DefaultAzureCredential());
+    }
+    this._openai = this._project.getOpenAIClient();
+    return this._openai;
   }
 }
 
