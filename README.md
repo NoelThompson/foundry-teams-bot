@@ -1,5 +1,9 @@
 # Foundry Teams Bot — Okta as Control Plane
 
+> ⚠️ **Demonstration code only — not production-ready.**
+>
+> This repository is a working reference architecture for showing how Okta can govern an AI agent's identity end-to-end across Microsoft Teams, Azure AI Foundry, and a downstream resource (ServiceNow). It is **not** hardened for production use. It cuts corners around state durability, secret management, multi-user concurrency, error handling, observability, and supply-chain security to keep the demo readable and easy to walk through. Do not deploy this verbatim against real users or sensitive data — see the [Known limitations](#known-limitations-demo-scope) section before adapting it.
+
 A Microsoft Teams bot fronting an **Azure AI Foundry agent**, gated behind Okta OAuth sign-in, with full **Cross-App Access (XAA / ID-JAG)** plumbing for issuing scoped, audited resource tokens that carry both the human user (`sub`) and the agent workload (`cid`) in a single Bearer.
 
 **Architectural intent**: the *agent's brain* (instructions, model, tools, behavior) lives entirely in **Azure AI Foundry** — editable from the Foundry portal, no redeploy required. The *bot* is a deliberately thin relay whose only jobs are:
@@ -195,11 +199,56 @@ Once deployed, agent behavior is controlled entirely from the Foundry portal:
 
 ## Known limitations (demo scope)
 
-- **Tokens live in process memory** (`oktaTokenStore.js`). Every App Service restart wipes them and forces re-auth. Production should swap to Cosmos / Storage.
-- **Foundry conversation IDs are also in-memory.** Bot restart loses the mapping; the Foundry-side conversation persists, but a new one will be started for the user.
-- **No actual ServiceNow tool yet** — `/testresource` produces a valid Bearer; tool-call interception is the next iteration.
-- **Single-tenant bot.** Runs in one Entra tenant.
-- **No step-up auth.** Demo relies on Okta's baseline policy for the OIDC app.
+This list is deliberately exhaustive. **Anything in here is a hole that needs to be plugged before this code is appropriate for production use.**
+
+### State durability
+
+- **Okta token store lives in process memory** (`oktaTokenStore.js`). Every App Service restart, container recycle, or scale-out event wipes the in-memory `Map` and forces every signed-in user to re-authenticate from scratch.
+  - **Production fix**: replace `oktaTokenStore.js` with persistent storage. Recommended targets:
+    - **Azure Cosmos DB** (low latency, partition key = `teamsUserId`).
+    - **Azure Table Storage** (cheaper, fine if you don't need fancy querying).
+    - **Azure Cache for Redis** (good if you're already using Redis; respects token TTL natively).
+  - Ensure the storage layer enforces token TTL (mirrors `expiresAt`) and is encrypted at rest.
+  - Add a refresh path: when the access token is near-expiry but `refresh_token` is present, exchange it transparently against Okta's `/oauth2/v1/token`.
+- **Foundry conversation IDs are also in-memory** (`foundryConversations` Map in `bot.js`). On bot restart, mappings are lost; the user gets a new Foundry conversation while the old one orphans server-side. Persist alongside the token store.
+- **OAuth pending-state map** (`tokenStore.pending`) is also in-memory. Mid-flight sign-ins during a restart will fail; users would have to retry.
+
+### Secret management
+
+- **All secrets are in plain App Service application settings**: `OKTA_OIDC_CLIENT_SECRET`, `OKTA_AGENT_PRIVATE_JWK`, `TOOL_API_KEY`, etc. App Service settings are encrypted at rest, but anyone with read access to the resource can see them.
+  - **Production fix**: move all secrets to **Azure Key Vault** and reference them from App Service via Key Vault references (`@Microsoft.KeyVault(...)`). Grant the App Service's managed identity `get` access on the secrets only.
+  - Rotate the AI Agent's private JWK on a schedule.
+- **Bot Framework App ID/Password** still uses a client secret on the Entra app registration. Migrate to a federated credential or certificate-based auth where possible.
+
+### Authentication & authorization
+
+- **Tool gateway uses a single shared API key** (`X-Tool-Api-Key`) for Foundry → bot calls. Anyone with that key can hit the tool endpoint.
+  - **Production fix**: use OAuth / managed-identity from Foundry to the bot, OR rotate the key frequently and tighten network ACLs (e.g., restrict bot endpoint to traffic from Foundry's outbound IPs).
+- **Single-active-user heuristic** (`tokenStore.getAnyValidTokens()`) is what backs the tool endpoint. It picks any signed-in user — fine when one person is using the demo at a time; broken the moment two users are concurrent.
+  - **Production fix**: pass the user's identifier through the Foundry agent context and look up the right user's tokens in the gateway. This requires plumbing user identity through the Foundry conversation (e.g., by stashing it in conversation metadata).
+- **No step-up authentication.** Sensitive tool calls (e.g., create/modify) should trigger a re-auth or MFA prompt; demo relies on Okta's baseline policy for the OIDC app.
+- **Bot is single-tenant.** Runs only in one Entra tenant. Multi-tenant distribution requires flipping the bot's Entra app registration `signInAudience` and reworking some auth assumptions.
+
+### Observability & operations
+
+- **Console logging only.** No structured logs, no Application Insights traces, no per-request correlation IDs, no metrics.
+  - **Production fix**: enable App Service Application Insights, add structured logging (Pino / Winston), include correlation IDs through every Bot Framework turn and into outbound calls.
+- **No alerting** on auth failures, XAA exchange failures, or downstream resource errors.
+- **No rate limiting / abuse protection.** A user could spam tool calls (and thus token mints) without limit.
+
+### Code & supply-chain
+
+- **Pinned-but-not-locked dependency versions.** `package.json` uses `^` ranges; transitive deps update freely.
+  - **Production fix**: commit `package-lock.json` (already done), use `npm ci`, audit with `npm audit` / `snyk` regularly.
+- **No CI/CD.** Deploys are manual zip-uploads via Cloud Shell.
+  - **Production fix**: GitHub Actions deploying to App Service via OIDC federation, with automated tests gating merges.
+- **No automated tests.** Behavior is verified manually via the slash commands.
+- **Error handling is opportunistic.** Many paths surface `err.message` directly to the user, which can leak internal info. Sanitize before display.
+
+### Compliance / governance
+
+- **No audit log of agent actions** beyond what Okta and ServiceNow capture independently. A real deployment should aggregate Foundry tool-call telemetry, Okta access-token issuance events, and ServiceNow API access logs into a unified audit trail keyed by user.
+- **No data retention policy** on Foundry conversations, the in-memory caches, or the bot's own logs.
 
 ## Built with
 
