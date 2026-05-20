@@ -8,6 +8,8 @@ const {
 const { EchoBot } = require('./bot');
 const tokenStore = require('./oktaTokenStore');
 
+const bot = new EchoBot();
+
 const credentialsFactory = new ConfigurationServiceClientCredentialFactory({
   MicrosoftAppId: process.env.MicrosoftAppId,
   MicrosoftAppPassword: process.env.MicrosoftAppPassword,
@@ -27,14 +29,48 @@ adapter.onTurnError = async (context, error) => {
   await context.sendActivity('Sorry, something went wrong.');
 };
 
-const bot = new EchoBot();
-
 const server = restify.createServer();
 server.use(restify.plugins.queryParser());
 server.use(restify.plugins.bodyParser());
 
 server.post('/api/messages', async (req, res) => {
   await adapter.process(req, res, (context) => bot.run(context));
+});
+
+function sendJson(res, status, payload) {
+  const body = JSON.stringify(payload);
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+server.get('/api/tools/list-incidents', async (req, res) => {
+  const expectedKey = process.env.TOOL_API_KEY;
+  if (!expectedKey) {
+    return sendJson(res, 500, { error: 'TOOL_API_KEY not configured on server.' });
+  }
+  const presentedKey =
+    req.headers['x-tool-api-key'] || req.headers['X-Tool-Api-Key'];
+  if (presentedKey !== expectedKey) {
+    return sendJson(res, 401, { error: 'Invalid or missing X-Tool-Api-Key.' });
+  }
+
+  const tokens = tokenStore.getAnyValidTokens();
+  if (!tokens || !tokens.idToken) {
+    return sendJson(res, 503, {
+      error:
+        'No signed-in user available. Sign in via the Teams bot first, then retry.',
+    });
+  }
+
+  const limit = req.query?.limit;
+  const result = await bot._toolListIncidents(tokens.idToken, { limit });
+  if (result.error) {
+    return sendJson(res, 502, result);
+  }
+  return sendJson(res, 200, result);
 });
 
 function sendHtml(res, status, html) {

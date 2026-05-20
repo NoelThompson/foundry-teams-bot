@@ -45,6 +45,15 @@ class OktaTokenStore {
     this.tokens.delete(teamsUserId);
   }
 
+  getAnyValidTokens() {
+    for (const [, entry] of this.tokens) {
+      if (!entry.expiresAt || entry.expiresAt > Date.now() + 30_000) {
+        return entry;
+      }
+    }
+    return null;
+  }
+
   _gcPending() {
     const cutoff = Date.now() - 10 * 60 * 1000;
     for (const [state, entry] of this.pending) {

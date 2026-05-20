@@ -345,6 +345,8 @@ class EchoBot extends TeamsActivityHandler {
   async _respondWithFoundryAgent(context) {
     const teamsConvId = context.activity.conversation.id;
     const userText = context.activity.text;
+    const userId = context.activity.from.id;
+    const userTokens = tokenStore.getTokens(userId);
 
     try {
       const openai = this._getOpenAIFromProject();
@@ -362,11 +364,52 @@ class EchoBot extends TeamsActivityHandler {
         });
       }
 
-      const response = await openai.responses.create(
+      let response = await openai.responses.create(
         { conversation: foundryConvId },
         { body: { agent_reference: { type: 'agent_reference', name: this.agentName } } },
       );
-      const reply = response.output_text || '(no reply)';
+
+      const MAX_TOOL_ITERATIONS = 5;
+      for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
+        const fnCalls = (response.output || []).filter(
+          (o) => o.type === 'function_call' || o.type === 'tool_call',
+        );
+        if (fnCalls.length === 0) break;
+
+        console.log(`[FoundryBot] dispatching ${fnCalls.length} tool call(s)`);
+        const outputs = [];
+        for (const fc of fnCalls) {
+          const fnName = fc.name || fc.function?.name;
+          const argsRaw = fc.arguments || fc.function?.arguments || '{}';
+          let args = {};
+          try { args = JSON.parse(argsRaw); } catch {}
+
+          let result;
+          if (fnName === 'list_recent_incidents') {
+            result = await this._toolListIncidents(userTokens?.idToken, args);
+          } else {
+            result = { error: `Unknown tool: ${fnName}` };
+          }
+          outputs.push({
+            type: 'function_call_output',
+            call_id: fc.call_id || fc.id,
+            output: JSON.stringify(result),
+          });
+        }
+
+        response = await openai.responses.create(
+          { previous_response_id: response.id, input: outputs },
+          { body: { agent_reference: { type: 'agent_reference', name: this.agentName } } },
+        );
+      }
+
+      let reply = response.output_text;
+      if (!reply) {
+        const msgItem = (response.output || []).find((o) => o.type === 'message');
+        const textPart = msgItem?.content?.find?.((c) => c.type === 'output_text' || c.type === 'text');
+        reply = textPart?.text || msgItem?.content?.[0]?.text;
+      }
+      if (!reply) reply = '(no reply)';
 
       await context.sendActivity(MessageFactory.text(reply));
     } catch (err) {
@@ -376,6 +419,99 @@ class EchoBot extends TeamsActivityHandler {
         MessageFactory.text(`Error talking to the agent: ${err.message}`),
       );
     }
+  }
+
+  async _mintResourceAccessToken(idToken) {
+    if (!idToken) return { error: 'No user ID token cached.' };
+    const cfg = this._oktaConfig();
+    if (!cfg.resourceAudience) {
+      return { error: 'OKTA_RESOURCE_AUDIENCE not configured.' };
+    }
+
+    const idJag = await this._exchangeForIdJag(idToken);
+    if (idJag.error) return { error: `ID-JAG: ${idJag.error}` };
+    if (idJag.status !== 200) {
+      return { error: `ID-JAG ${idJag.status}: ${JSON.stringify(idJag.body)}` };
+    }
+
+    const resourceTokenUrl = `${cfg.oktaDomain}/oauth2/${cfg.authServerId}/v1/token`;
+    const { jwk, error } = this._loadAgentJwk();
+    if (error) return { error };
+    let clientAssertion;
+    try {
+      clientAssertion = await this._signClientAssertion(
+        jwk,
+        cfg.principalId,
+        resourceTokenUrl,
+        'res-ca',
+      );
+    } catch (err) {
+      return { error: `Sign assertion: ${err.message}` };
+    }
+
+    const body = new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion: idJag.body.access_token,
+      audience: cfg.resourceAudience,
+      client_assertion_type:
+        'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',
+      client_assertion: clientAssertion,
+    });
+
+    let resp;
+    try {
+      resp = await fetch(resourceTokenUrl, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: body.toString(),
+      });
+    } catch (err) {
+      return { error: `Resource exchange: ${err.message}` };
+    }
+    const text = await resp.text();
+    let json;
+    try { json = JSON.parse(text); } catch {
+      return { error: `Non-JSON resource response (${resp.status}): ${text.slice(0, 200)}` };
+    }
+    if (resp.status !== 200) {
+      return { error: `Resource exchange ${resp.status}: ${JSON.stringify(json)}` };
+    }
+    return { accessToken: json.access_token };
+  }
+
+  async _toolListIncidents(idToken, args = {}) {
+    const tokenResult = await this._mintResourceAccessToken(idToken);
+    if (tokenResult.error) return { error: tokenResult.error };
+
+    const instance =
+      process.env.SERVICENOW_INSTANCE_URL || 'https://ven04722.service-now.com';
+    const limit = Math.min(Math.max(parseInt(args.limit, 10) || 5, 1), 25);
+    const fields = 'number,short_description,state,priority,sys_created_on';
+    const url = `${instance}/api/now/table/incident?sysparm_limit=${limit}&sysparm_fields=${fields}`;
+
+    let resp;
+    try {
+      resp = await fetch(url, {
+        headers: {
+          Authorization: `Bearer ${tokenResult.accessToken}`,
+          Accept: 'application/json',
+        },
+      });
+    } catch (err) {
+      return { error: `ServiceNow request failed: ${err.message}` };
+    }
+    const text = await resp.text();
+    let json;
+    try { json = JSON.parse(text); } catch {
+      return { error: `Non-JSON from ServiceNow (${resp.status}): ${text.slice(0, 300)}` };
+    }
+    if (resp.status !== 200) {
+      return { error: `ServiceNow ${resp.status}: ${JSON.stringify(json).slice(0, 500)}` };
+    }
+    return { incidents: json.result || [] };
   }
 
   _getOpenAIFromProject() {
