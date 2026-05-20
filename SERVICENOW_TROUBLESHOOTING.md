@@ -1,4 +1,13 @@
-# ServiceNow trust troubleshooting (open issue)
+# ServiceNow trust troubleshooting
+
+> **RESOLVED 2026-05-20.** Root cause was a missing **OAuth Scope** record on the OIDC Provider entity. ServiceNow validates the `scp` claim against registered scopes; without `mcp:read` registered, validation failed with the misleading error `BadJWSException: failed to verify signature` — which sounds like a cryptography problem but was actually a scope-authorization failure inside the same validator. Adding `mcp:read` as an OAuth Scope on the OIDC Provider record (just Name + Description) resolved it instantly.
+>
+> **Lesson**: when ServiceNow returns persistent `BadJWSException` and your signature actually verifies externally (try jwt.io against the JWKS), check the OIDC entity's Scopes related list before anything else. SN's error reporting bundles signature + scope validation under the same exception name.
+
+---
+
+# Original troubleshooting log (kept for reference)
+
 
 The bot's Cross-App Access (XAA / ID-JAG) flow works end-to-end through Okta — `/testjag` and `/testresource` slash commands both produce a properly-formed access token signed by our Okta auth server, with correct `iss`, `aud`, `sub` (human user), `cid` (agent workload), and scope claims. Foundry agent calls our tool endpoint; tool endpoint mints the XAA-scoped Bearer; bot fires `GET /api/now/table/incident` against ServiceNow.
 
