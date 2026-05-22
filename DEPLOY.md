@@ -165,7 +165,173 @@ az webapp deploy \
   --type zip
 ```
 
-## 9. Verify the chain
+## 9. ServiceNow tool wiring (downstream resource)
+
+This is the part that actually lets the agent fetch real data. Has two halves: registering the tool with the Foundry agent, and configuring ServiceNow to trust your Okta tokens.
+
+### 9a. Register the OpenAPI tool on the Foundry agent
+
+The agent declares the function it can call; Foundry's runtime makes the HTTP call when the agent decides to use it.
+
+1. Foundry portal → your agent (`Foundry-Okta-Agent`) → **Tools** → **+ Add tool** → **Custom function** (or **OpenAPI tool** — naming varies). The form will require an OpenAPI 3.0+ spec.
+2. **Authentication method**: pick **API Key** (header). Header name `X-Tool-Api-Key`. Value: a 32+ byte hex string you generate (`node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`). Save the value — you'll paste it into the bot's App Settings as `TOOL_API_KEY`.
+3. **OpenAPI spec** (paste verbatim, replacing the URL with your App Service hostname):
+
+```json
+{
+  "openapi": "3.0.0",
+  "info": { "title": "Foundry Bot tool gateway", "version": "1.0.0" },
+  "servers": [{ "url": "https://<your-app-name>.azurewebsites.net" }],
+  "paths": {
+    "/api/tools/list-incidents": {
+      "get": {
+        "operationId": "list_recent_incidents",
+        "summary": "List the user's recent ServiceNow incidents",
+        "description": "Returns a brief summary of recent ServiceNow incidents the user has access to.",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum number of incidents to return (default 5, max 25)",
+            "required": false,
+            "schema": { "type": "integer", "default": 5, "minimum": 1, "maximum": 25 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "incidents": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "number": { "type": "string" },
+                          "short_description": { "type": "string" },
+                          "state": { "type": "string" },
+                          "priority": { "type": "string" },
+                          "sys_created_on": { "type": "string" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "ApiKeyAuth": { "type": "apiKey", "in": "header", "name": "X-Tool-Api-Key" }
+    }
+  },
+  "security": [{ "ApiKeyAuth": [] }]
+}
+```
+
+4. **Update the agent's instructions** to tell it about the tool — paste this paragraph alongside whatever else is in the Instructions field:
+
+```
+You have one tool: `list_recent_incidents`. When the user asks about
+ServiceNow incidents, tickets, or open issues, call this tool to fetch
+real data. After the tool returns, summarize the incidents in a short
+readable list. Don't fabricate incident details — only use what the
+tool returns.
+```
+
+5. Add the bot's App Settings for the tool gateway:
+
+```bash
+az webapp config appsettings set \
+  --name <app-name> \
+  --resource-group <rg-name> \
+  --settings \
+    TOOL_API_KEY=<the-key-you-generated-in-step-2> \
+    SERVICENOW_INSTANCE_URL=https://<your-instance>.service-now.com
+```
+
+### 9b. Configure ServiceNow to trust your Okta tokens
+
+ServiceNow needs to validate inbound JWTs against your Okta auth server's JWKS, accept the audience your tokens use, and resolve the `sub` claim to a real ServiceNow user. This is configured under **System OAuth → Application Registry**.
+
+> ⚠️ **Important**: ServiceNow's OAuth setup has *many* form types in the same place. Pick the right one. We learned this the hard way; see `SERVICENOW_TROUBLESHOOTING.md` for the full debugging journey.
+
+1. **System OAuth → Application Registry → New** → on the type-picker page, choose **`[Deprecated UI] Configure an OIDC provider to verify ID tokens`**. This is the inbound-validation path. **Do NOT** pick:
+   - `Connect to a third party OAuth Provider` (outbound — wrong direction).
+   - `[Deprecated UI] Create an OAuth API endpoint for external clients` (older/different validation chain).
+   - `New Inbound Integration Experience` (newer wizard; works but adds layers).
+
+2. Fill the parent OAuth API endpoint form:
+
+   | Field | Value |
+   |---|---|
+   | Name | `Okta-Foundry-XAA-OIDC` |
+   | **Client ID** | the audience URI your tokens carry, e.g. `https://oktademo.mcp.servicenow.com`. ServiceNow uses this to match incoming tokens to this entity by `aud`. **Cannot be changed later** — pick a value unique to this integration. |
+   | Client Secret | leave the auto-generated value; not used for inbound JWT validation |
+   | User field | **Email** — ServiceNow will look up users by matching the `sub` claim to this column |
+   | Token Format | **JWT** (NOT Opaque — JWT bearers won't validate against the opaque-token table) |
+   | Active | checked |
+
+   Save.
+
+3. Open the saved record and create the **OIDC Provider Configuration** sub-record (look for a reference field with the same label, click the magnifying glass → New):
+
+   | Field | Value |
+   |---|---|
+   | OIDC Provider | `Okta-Foundry-XAA` (any descriptive label) |
+   | OIDC Metadata URL | `https://<okta-org>/oauth2/<auth-server-id>/.well-known/openid-configuration` |
+   | User claim | **`sub`** — must be filled in. ServiceNow uses this to extract the user identifier from the validated token. |
+
+   Save.
+
+4. **Register the scope** that your tokens carry. On the parent record, find the **OAuth Entity Scopes** related list → **New**:
+
+   | Field | Value |
+   |---|---|
+   | Name | `mcp:read` (must match exactly what your bot's `OKTA_REQUESTED_SCOPE` requests) |
+   | Description | "Read access for AI agent / Cross-App Access tokens" |
+
+   Save.
+
+   > ⚠️ **This is the step that's easiest to miss and the hardest to diagnose.** Without `mcp:read` registered as an OAuth Entity Scope, ServiceNow rejects tokens with `BadJWSException: failed to verify signature` — a misleading error that sounds cryptographic but is actually a scope-authorization failure. Don't skip it.
+
+5. **What NOT to add**: leave these alone. Adding them can break OIDC-discovery-based key resolution.
+   - JWT Verifier Maps (the parent record auto-fetches keys via the metadata URL)
+   - Sys Certificates with manually wrapped public keys
+   - OAuth JWT Claim Validations (only needed if you want extra defensive checks beyond what the OIDC entity already enforces)
+
+6. **User mapping**: confirm there's a ServiceNow user record with `Email` matching the `sub` of the tokens you'll mint (e.g., `noel.thompson@okta.com`). If absent, the validator passes but ServiceNow returns 401 with no user resolved.
+
+7. **User permissions**: the matched ServiceNow user needs roles for the resources you'll touch. For the `/api/now/table/incident` GET, the user typically needs `itil` (or admin) on `ven04722`-style demo instances.
+
+### 9c. Smoke test from outside the bot
+
+Before testing through the agent, prove ServiceNow trusts your tokens directly:
+
+```bash
+# In Teams: run /testresource and copy the access_token value from the response
+# Then in Cloud Shell:
+curl -i -H "Authorization: Bearer <paste-access-token>" \
+  "https://<your-instance>.service-now.com/api/now/table/incident?sysparm_limit=1"
+```
+
+- **`200 OK` with incident JSON** → ServiceNow trust is configured correctly. Move on to step 10.
+- **`401 User is not authenticated`** → check **System Logs** filtered for `OIDC` or `JWT` keywords for the actual cause. Common culprits ranked by frequency:
+  1. Missing OAuth Entity Scope (`mcp:read` not registered).
+  2. `User claim` field on OIDC Provider Configuration is empty.
+  3. ServiceNow user with that email doesn't exist.
+  4. JTI replay protection is enabled and you're reusing a token (uncheck "Enable JTI Verification" or mint a fresh token).
+  5. Two OIDC entities with the same Client ID — ServiceNow can match the wrong one.
+  6. Token `aud` doesn't match the entity's Client ID.
+
+## 10. Verify the chain
 
 In Teams:
 
@@ -186,6 +352,17 @@ In Teams:
 | `400 The 'agent' property is deprecated` | Old SDK shape. | Use `body: { agent_reference: { type: 'agent_reference', name } }`. |
 | `400 Required properties ['type'] are not present` | Missing `type` on `agent_reference`. | Add `type: 'agent_reference'` inside the agent_reference object. |
 | `agent not found` | Name mismatch (case-sensitive). | Confirm `FOUNDRY_AGENT_NAME` matches Foundry portal exactly. |
+
+## Common errors + fixes (ServiceNow trust)
+
+| Error / symptom | Cause | Fix |
+|---|---|---|
+| `401 User is not authenticated` (with no SN log entry) | OIDC entity not active, or token `aud` doesn't match any entity's Client ID. | Check **Active** flag; verify Client ID on the entity matches the `aud` of your tokens. |
+| `BadJWSException: failed to verify signature` | **Most often: `mcp:read` not registered as an OAuth Entity Scope** (misleading error). Less commonly: stale JWKS cache. | Add `mcp:read` to **OAuth Entity Scopes** on the OIDC entity. If that doesn't fix it, force JWKS refresh by saving the OIDC Provider Configuration record. |
+| `Cannot find oauth_oidc_entity for issuer X with client_ids Y` | No matching OIDC entity for the token's issuer + audience pair. | Create the OIDC entity (step 9b.1) with Client ID matching your token's `aud`. |
+| `JTI claim 'jti' verification failed, duplicated JTI found` | JTI replay protection enabled; you're reusing a token. | Either uncheck "Enable JTI Verification" on the parent record (fine for testing), or always mint fresh tokens (`/testresource` in Teams gives a new one each call). |
+| `OIDC token verification failed : Invalid JWT Signature` (after correct OAuth Entity Scope is registered) | Two OIDC entities have the same Client ID; ServiceNow matched the wrong one. | Make Client ID unique. The parent record's Client ID is immutable after creation — delete and recreate with a unique value if needed. |
+| `403` instead of `401` | Token validates, but the resolved ServiceNow user lacks role for the table. | Grant `itil` (or appropriate role) to the user matching the `sub` claim. |
 
 ## Common errors + fixes (XAA chain)
 
